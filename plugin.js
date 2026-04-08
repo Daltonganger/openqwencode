@@ -42,6 +42,8 @@ const REQUEST_MAX_ATTEMPTS = 3;
 const SYSTEM_MESSAGE =
   'You are Qwen Code, an interactive CLI agent developed by Alibaba Group, specializing in software engineering tasks. Your primary goal is to help users safely and efficiently, adhering strictly to the following instructions and utilizing your available tools.';
 const DEFAULT_REQUEST_CHANNEL = 'opencode';
+const DEFAULT_REQUEST_SESSION_ID = randomUUID();
+const UPSTREAM_USER_AGENT_PRODUCT = 'QwenCode';
 
 const QWEN_OAUTH_CONFIG = {
   baseUrl: 'https://chat.qwen.ai',
@@ -743,6 +745,47 @@ function decodeBody(body) {
   return null;
 }
 
+function normalizeImageUrlPart(part) {
+  const imageUrl = part?.image_url ?? part?.url;
+  if (typeof imageUrl === 'string') {
+    return { type: 'image_url', image_url: { url: imageUrl } };
+  }
+
+  if (imageUrl && typeof imageUrl === 'object' && typeof imageUrl.url === 'string') {
+    return { type: 'image_url', image_url: { url: imageUrl.url } };
+  }
+
+  return null;
+}
+
+function normalizeMessagePart(part) {
+  if (!part || typeof part !== 'object') return part;
+
+  switch (part.type) {
+    case 'input_text':
+    case 'output_text':
+    case 'text':
+      return { type: 'text', text: String(part.text ?? '') };
+    case 'input_image':
+      return normalizeImageUrlPart(part);
+    default:
+      return part;
+  }
+}
+
+function normalizeMessageContent(content, role) {
+  if (typeof content === 'string') {
+    if (role === 'system' || role === 'tool') return content;
+    return [{ type: 'text', text: content }];
+  }
+
+  if (Array.isArray(content)) {
+    return content.map(normalizeMessagePart).filter(Boolean);
+  }
+
+  return content;
+}
+
 function transformRequestBody(body) {
   if (!body) return body;
 
@@ -751,15 +794,26 @@ function transformRequestBody(body) {
     if (!raw) return body;
 
     const parsed = JSON.parse(raw);
-    const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+    const messages = Array.isArray(parsed.messages)
+      ? parsed.messages.map(message => {
+          if (!message || typeof message !== 'object') return message;
+          return {
+            ...message,
+            content: normalizeMessageContent(message.content, message.role),
+          };
+        })
+      : [];
     const metadata = parsed.metadata && typeof parsed.metadata === 'object' ? parsed.metadata : {};
     if (!metadata.promptId) metadata.promptId = randomUUID();
+    if (!metadata.sessionId) metadata.sessionId = DEFAULT_REQUEST_SESSION_ID;
     if (!metadata.channel) metadata.channel = DEFAULT_REQUEST_CHANNEL;
     parsed.metadata = metadata;
 
     // OpenCode does not always send a system message, but Qwen Code expects one.
     if (!messages.some(message => message?.role === 'system')) {
       parsed.messages = [{ role: 'system', content: SYSTEM_MESSAGE }, ...messages];
+    } else {
+      parsed.messages = messages;
     }
 
     return JSON.stringify(parsed);
@@ -782,7 +836,7 @@ function prepareRequestBody(body) {
 
 function buildHeaders(token, initHeaders) {
   const headers = new Headers(initHeaders);
-  const userAgent = `OpenQwenCode/${PACKAGE_VERSION} (${process.platform}; ${process.arch})`;
+  const userAgent = `${UPSTREAM_USER_AGENT_PRODUCT}/${PACKAGE_VERSION} (${process.platform}; ${process.arch})`;
   headers.set('Authorization', `Bearer ${token}`);
   headers.set('User-Agent', userAgent);
   headers.set('X-DashScope-AuthType', 'qwen-oauth');

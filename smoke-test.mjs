@@ -8,7 +8,7 @@ const modulePath = new URL('./index.js', import.meta.url).href;
 const pluginModulePath = new URL('./plugin.js', import.meta.url).href;
 const eventsModulePath = new URL('./events.js', import.meta.url).href;
 const packageJson = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'));
-const userAgentPrefix = `OpenQwenCode/${packageJson.version} `;
+const userAgentPrefix = `QwenCode/${packageJson.version} `;
 
 test('plugin registers provider and disables legacy providers', async () => {
   process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
@@ -136,9 +136,12 @@ test('loader bootstraps creds, persists them, and retries with refresh on 401', 
     assert.equal(parsedBody.messages[0].role, 'system');
     assert.match(parsedBody.messages[0].content, /You are Qwen Code/);
     assert.equal(parsedBody.messages[1].role, 'user');
+    assert.deepEqual(parsedBody.messages[1].content, [{ type: 'text', text: 'Hello' }]);
     assert.equal(parsedBody.metadata.channel, 'opencode');
     assert.equal(typeof parsedBody.metadata.promptId, 'string');
+    assert.equal(typeof parsedBody.metadata.sessionId, 'string');
     assert.ok(parsedBody.metadata.promptId.length > 10);
+    assert.ok(parsedBody.metadata.sessionId.length > 10);
 
     const refreshedCreds = JSON.parse(await readFile(credsPath, 'utf8'));
     assert.equal(refreshedCreds.access_token, 'new-token');
@@ -305,6 +308,66 @@ test('failed refresh returns a readable 401 response body', async () => {
 
     assert.equal(response.status, 401);
     assert.equal(await response.text(), 'unauthorized');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('string chat content is normalized into text parts', async () => {
+  process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
+
+  let capturedRequestBody = null;
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    const request = input instanceof Request ? input : new Request(input, init);
+
+    if (url === 'https://portal.qwen.ai/v1/chat/completions') {
+      capturedRequestBody = JSON.parse(request.body ? await request.text() : '{}');
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const pluginModule = await import(`${pluginModulePath}?case=content-normalization-${Date.now()}`);
+    const plugin = await pluginModule.default();
+
+    const authState = {
+      type: 'oauth',
+      access: 'initial-token',
+      refresh: 'initial-refresh',
+      expires: Date.now() + 5 * 60_000,
+      accountId: 'https://portal.qwen.ai',
+    };
+
+    const loader = await plugin.auth.loader(async () => authState, {
+      models: { 'coder-model': { cost: { input: 1, output: 1 } } },
+    });
+
+    await loader.fetch('https://portal.qwen.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        messages: [
+          { role: 'user', content: 'Plain user text' },
+          { role: 'assistant', content: 'Plain assistant text' },
+          { role: 'tool', content: 'Tool output text' },
+        ],
+      }),
+    });
+
+    assert.ok(capturedRequestBody);
+    assert.deepEqual(capturedRequestBody.messages[1].content, [{ type: 'text', text: 'Plain user text' }]);
+    assert.deepEqual(capturedRequestBody.messages[2].content, [{ type: 'text', text: 'Plain assistant text' }]);
+    assert.equal(capturedRequestBody.messages[3].content, 'Tool output text');
+    assert.equal(typeof capturedRequestBody.metadata.sessionId, 'string');
+    assert.ok(capturedRequestBody.metadata.sessionId.length > 10);
   } finally {
     globalThis.fetch = originalFetch;
   }

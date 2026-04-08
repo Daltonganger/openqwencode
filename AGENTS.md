@@ -14,7 +14,7 @@ Use this file as the project memory for working rules, release behavior, current
 
 ## Current project status
 
-Current release: `0.1.4`
+Current release: `0.1.5`
 
 The plugin currently includes:
 
@@ -28,7 +28,8 @@ The plugin currently includes:
 - auth cancellation hooks
 - legacy provider disabling
 - request metadata injection for upstream compatibility
-- smoke tests for provider registration, refresh-on-401 behavior, concurrent refresh deduplication, readable refresh failures, and package export shape
+- request normalization for OpenCode chat payload compatibility
+- smoke tests for provider registration, refresh-on-401 behavior, concurrent refresh deduplication, readable refresh failures, request normalization, and package export shape
 
 ## Repository map
 
@@ -231,9 +232,9 @@ Priority: nice-to-have
 
 - single-flight refresh deduplication was added to avoid concurrent refresh races
 - package export shape was fixed so OpenCode now loads the plugin correctly
-- request metadata and user-agent handling were tightened for upstream compatibility
+- request metadata, request normalization, and user-agent handling were tightened for upstream compatibility
 - npm publish hygiene checks were added to CI and release automation
-- release `0.1.3` was published with successful GitHub Actions validation and release workflow execution
+- release `0.1.4` was published with successful GitHub Actions validation and release workflow execution
 
 ## Probably not worth the complexity right now
 
