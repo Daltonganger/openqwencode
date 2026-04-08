@@ -3,10 +3,9 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-
-const modulePath = pathToFileURL('/Users/ruben/Documents/openqwencode/index.js').href;
-const pluginModulePath = pathToFileURL('/Users/ruben/Documents/openqwencode/plugin.js').href;
+const modulePath = new URL('./index.js', import.meta.url).href;
+const pluginModulePath = new URL('./plugin.js', import.meta.url).href;
+const eventsModulePath = new URL('./events.js', import.meta.url).href;
 
 test('plugin registers provider and disables legacy providers', async () => {
   process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
@@ -257,7 +256,7 @@ test('plugin internals remain available through subpath exports', async () => {
   assert.equal(typeof pluginModule.default, 'function');
   assert.equal(typeof pluginModule.QwenAuthPlugin, 'function');
 
-  const eventsModule = await import(`${pathToFileURL('/Users/ruben/Documents/openqwencode/events.js').href}?case=events-${Date.now()}`);
+  const eventsModule = await import(`${eventsModulePath}?case=events-${Date.now()}`);
   assert.equal(typeof eventsModule.cancelActiveQwenAuth, 'function');
   assert.equal(typeof eventsModule.qwenAuthEvents.emit, 'function');
 });
