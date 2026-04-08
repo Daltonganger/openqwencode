@@ -12,8 +12,12 @@ import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+
+const require = createRequire(import.meta.url);
+const { version: PACKAGE_VERSION } = require('./package.json');
 
 const PROVIDER_ID = 'openqwencode';
 const PROVIDER_NAME = 'OpenQwenCode';
@@ -37,6 +41,7 @@ const REFRESH_MAX_ATTEMPTS = 3;
 const REQUEST_MAX_ATTEMPTS = 3;
 const SYSTEM_MESSAGE =
   'You are Qwen Code, an interactive CLI agent developed by Alibaba Group, specializing in software engineering tasks. Your primary goal is to help users safely and efficiently, adhering strictly to the following instructions and utilizing your available tools.';
+const DEFAULT_REQUEST_CHANNEL = 'opencode';
 
 const QWEN_OAUTH_CONFIG = {
   baseUrl: 'https://chat.qwen.ai',
@@ -747,9 +752,16 @@ function transformRequestBody(body) {
 
     const parsed = JSON.parse(raw);
     const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
-    if (messages.some(message => message?.role === 'system')) return raw;
+    const metadata = parsed.metadata && typeof parsed.metadata === 'object' ? parsed.metadata : {};
+    if (!metadata.promptId) metadata.promptId = randomUUID();
+    if (!metadata.channel) metadata.channel = DEFAULT_REQUEST_CHANNEL;
+    parsed.metadata = metadata;
 
-    parsed.messages = [{ role: 'system', content: SYSTEM_MESSAGE }, ...messages];
+    // OpenCode does not always send a system message, but Qwen Code expects one.
+    if (!messages.some(message => message?.role === 'system')) {
+      parsed.messages = [{ role: 'system', content: SYSTEM_MESSAGE }, ...messages];
+    }
+
     return JSON.stringify(parsed);
   } catch {
     return body;
@@ -770,10 +782,12 @@ function prepareRequestBody(body) {
 
 function buildHeaders(token, initHeaders) {
   const headers = new Headers(initHeaders);
+  const userAgent = `OpenQwenCode/${PACKAGE_VERSION} (${process.platform}; ${process.arch})`;
   headers.set('Authorization', `Bearer ${token}`);
+  headers.set('User-Agent', userAgent);
   headers.set('X-DashScope-AuthType', 'qwen-oauth');
   headers.set('X-DashScope-CacheControl', 'enable');
-  headers.set('X-DashScope-UserAgent', `OpenQwenCode/0.1.3 (${process.platform}; ${process.arch})`);
+  headers.set('X-DashScope-UserAgent', userAgent);
   return headers;
 }
 
@@ -848,13 +862,12 @@ function buildFetchWithAuth(getAuth) {
       if ((response.status === 401 || response.status === 403) && requestBody.replayable) {
         if (attempt === REQUEST_MAX_ATTEMPTS - 1) return response;
 
-        await response.body?.cancel?.().catch?.(() => {});
-
         const refreshed = await getValidCredentials(getAuth, { forceRefresh: true, signal });
         if (!refreshed?.accessToken || refreshed.accessToken === credentials.accessToken) {
           return response;
         }
 
+        await response.body?.cancel?.().catch?.(() => {});
         debugLog('Received auth error from upstream; retrying with refreshed token');
         credentials = refreshed;
         continue;

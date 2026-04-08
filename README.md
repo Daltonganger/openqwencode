@@ -88,9 +88,17 @@ Run OpenCode with the plugin model:
 opencode --model openqwencode/coder-model
 ```
 
+If you upgraded from an older published version and OpenCode still does not see the model, clear the cached package and refresh:
+
+```bash
+rm -rf ~/.cache/opencode/packages/openqwencode@latest ~/.cache/opencode/node_modules/openqwencode
+opencode models --refresh
+```
+
 ## Notes
 
 - upstream `QwenLM/qwen-code` only uses `coder-model` for the free OAuth flow
 - `qwen3-coder-plus`, `qwen3-vl-plus`, and `vision-model` are intentionally no longer exposed
 - the plugin injects the Qwen OAuth headers and a minimal Qwen Code system message
 - the local credential file is the primary source of truth; OpenCode auth state is only used as a bootstrap/migration path
+- project rules, release workflow, and backlog now live in `AGENTS.md`

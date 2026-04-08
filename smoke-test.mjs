@@ -3,9 +3,12 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
 const modulePath = new URL('./index.js', import.meta.url).href;
 const pluginModulePath = new URL('./plugin.js', import.meta.url).href;
 const eventsModulePath = new URL('./events.js', import.meta.url).href;
+const packageJson = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'));
+const userAgentPrefix = `OpenQwenCode/${packageJson.version} `;
 
 test('plugin registers provider and disables legacy providers', async () => {
   process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
@@ -126,12 +129,16 @@ test('loader bootstraps creds, persists them, and retries with refresh on 401', 
     assert.equal(upstreamCalls.length, 2);
     assert.equal(upstreamCalls[0].headers.authorization, 'Bearer initial-token');
     assert.equal(upstreamCalls[1].headers.authorization, 'Bearer new-token');
-    assert.match(upstreamCalls[1].headers['x-dashscope-useragent'], /^OpenQwenCode\/0\.1\.3 /);
+    assert.ok(upstreamCalls[1].headers['user-agent']?.startsWith(userAgentPrefix));
+    assert.ok(upstreamCalls[1].headers['x-dashscope-useragent']?.startsWith(userAgentPrefix));
 
     const parsedBody = JSON.parse(upstreamCalls[1].bodyText);
     assert.equal(parsedBody.messages[0].role, 'system');
     assert.match(parsedBody.messages[0].content, /You are Qwen Code/);
     assert.equal(parsedBody.messages[1].role, 'user');
+    assert.equal(parsedBody.metadata.channel, 'opencode');
+    assert.equal(typeof parsedBody.metadata.promptId, 'string');
+    assert.ok(parsedBody.metadata.promptId.length > 10);
 
     const refreshedCreds = JSON.parse(await readFile(credsPath, 'utf8'));
     assert.equal(refreshedCreds.access_token, 'new-token');
@@ -244,6 +251,60 @@ test('concurrent 401 retries share a single token refresh', async () => {
     const refreshedCreds = JSON.parse(await readFile(credsPath, 'utf8'));
     assert.equal(refreshedCreds.access_token, 'shared-new-token');
     assert.equal(refreshedCreds.refresh_token, 'shared-new-refresh');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('failed refresh returns a readable 401 response body', async () => {
+  process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
+
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    const request = input instanceof Request ? input : new Request(input, init);
+
+    if (url === 'https://chat.qwen.ai/api/v1/oauth2/token') {
+      return new Response(JSON.stringify({ error: 'invalid_request' }), {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    if (url === 'https://portal.qwen.ai/v1/chat/completions') {
+      if (request.headers.get('authorization') === 'Bearer initial-token') {
+        return new Response('unauthorized', { status: 401 });
+      }
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const pluginModule = await import(`${pluginModulePath}?case=refresh-failure-${Date.now()}`);
+    const plugin = await pluginModule.default();
+
+    const authState = {
+      type: 'oauth',
+      access: 'initial-token',
+      refresh: 'initial-refresh',
+      expires: Date.now() + 5 * 60_000,
+      accountId: 'https://portal.qwen.ai',
+    };
+
+    const loader = await plugin.auth.loader(async () => authState, {
+      models: { 'coder-model': { cost: { input: 1, output: 1 } } },
+    });
+
+    const response = await loader.fetch('https://portal.qwen.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'Hello' }] }),
+    });
+
+    assert.equal(response.status, 401);
+    assert.equal(await response.text(), 'unauthorized');
   } finally {
     globalThis.fetch = originalFetch;
   }
