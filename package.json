@@ -1,0 +1,41 @@
+{
+  "name": "openqwencode",
+  "version": "0.1.0",
+  "description": "OpenCode plugin for Qwen OAuth login and free Qwen Code models",
+  "author": "Daltonganger",
+  "type": "module",
+  "main": "./index.js",
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./index.js"
+  },
+  "scripts": {
+    "test": "node --test smoke-test.mjs"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "qwen",
+    "qwen-code",
+    "oauth",
+    "authentication"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Daltonganger/openqwencode.git"
+  },
+  "homepage": "https://github.com/Daltonganger/openqwencode#readme",
+  "bugs": {
+    "url": "https://github.com/Daltonganger/openqwencode/issues"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.5.2"
+  }
+}
