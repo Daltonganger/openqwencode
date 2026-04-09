@@ -259,6 +259,65 @@ test('concurrent 401 retries share a single token refresh', async () => {
   }
 });
 
+test('concurrent authenticated requests are lightly throttled before reaching upstream', async () => {
+  process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
+
+  const requestTimestamps = [];
+  const originalFetch = globalThis.fetch;
+  const originalRandom = Math.random;
+
+  Math.random = () => 0;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://portal.qwen.ai/v1/chat/completions') {
+      requestTimestamps.push(Date.now());
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const pluginModule = await import(`${pluginModulePath}?case=request-throttle-${Date.now()}`);
+    const plugin = await pluginModule.default();
+
+    const authState = {
+      type: 'oauth',
+      access: 'initial-token',
+      refresh: 'initial-refresh',
+      expires: Date.now() + 5 * 60_000,
+      accountId: 'https://portal.qwen.ai',
+    };
+
+    const loader = await plugin.auth.loader(async () => authState, {
+      models: { 'coder-model': { cost: { input: 1, output: 1 } } },
+    });
+
+    await Promise.all([
+      loader.fetch('https://portal.qwen.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'First request' }] }),
+      }),
+      loader.fetch('https://portal.qwen.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'Second request' }] }),
+      }),
+    ]);
+
+    assert.equal(requestTimestamps.length, 2);
+    assert.ok(requestTimestamps[1] - requestTimestamps[0] >= 290);
+  } finally {
+    Math.random = originalRandom;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('failed refresh returns a readable 401 response body', async () => {
   process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
 
@@ -309,6 +368,85 @@ test('failed refresh returns a readable 401 response body', async () => {
     assert.equal(response.status, 401);
     assert.equal(await response.text(), 'unauthorized');
   } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('rate-limited responses are converted into OpenAI-compatible JSON without debug noise by default', async () => {
+  process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
+  // The plugin reads this flag at import time, so clear it before loading the module.
+  delete process.env.OPENQWENCODE_DEBUG;
+
+  let requestCount = 0;
+  let debugCalls = 0;
+  const originalFetch = globalThis.fetch;
+  const originalDebug = console.debug;
+
+  console.debug = () => {
+    debugCalls += 1;
+  };
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    const request = input instanceof Request ? input : new Request(input, init);
+
+    if (url === 'https://portal.qwen.ai/v1/chat/completions') {
+      requestCount += 1;
+      assert.equal(request.headers.get('authorization'), 'Bearer initial-token');
+
+      return new Response('<html><body>Too Many Requests</body></html>', {
+        status: 429,
+        statusText: 'Too Many Requests',
+        headers: {
+          'content-type': 'text/html',
+          'retry-after': '7',
+          'retry-after-ms': '1',
+        },
+      });
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const pluginModule = await import(`${pluginModulePath}?case=rate-limit-shape-${Date.now()}`);
+    const plugin = await pluginModule.default();
+
+    const authState = {
+      type: 'oauth',
+      access: 'initial-token',
+      refresh: 'initial-refresh',
+      expires: Date.now() + 5 * 60_000,
+      accountId: 'https://portal.qwen.ai',
+    };
+
+    const loader = await plugin.auth.loader(async () => authState, {
+      models: { 'coder-model': { cost: { input: 1, output: 1 } } },
+    });
+
+    const response = await loader.fetch('https://portal.qwen.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'Hello' }] }),
+    });
+
+    assert.equal(requestCount, 3);
+    assert.equal(debugCalls, 0);
+    assert.equal(response.status, 429);
+    assert.match(response.headers.get('content-type') ?? '', /^application\/json/i);
+    assert.equal(response.headers.get('retry-after'), '7');
+
+    const payload = await response.json();
+    assert.deepEqual(payload, {
+      error: {
+        message: 'Too Many Requests',
+        type: 'rate_limit_error',
+        param: null,
+        code: 'rate_limit_exceeded',
+      },
+    });
+  } finally {
+    console.debug = originalDebug;
     globalThis.fetch = originalFetch;
   }
 });

@@ -39,6 +39,10 @@ const DEVICE_POLL_MARGIN_MS = 3_000;
 const DEVICE_POLL_MAX_INTERVAL_MS = 15_000;
 const REFRESH_MAX_ATTEMPTS = 3;
 const REQUEST_MAX_ATTEMPTS = 3;
+const REQUEST_THROTTLE_MIN_SPACING_MS = 300;
+const REQUEST_THROTTLE_JITTER_MS = 150;
+const BACKOFF_JITTER_RATIO = 0.2;
+const DEBUG_ENABLED = /^(1|true|yes)$/i.test(process.env.OPENQWENCODE_DEBUG ?? '');
 const SYSTEM_MESSAGE =
   'You are Qwen Code, an interactive CLI agent developed by Alibaba Group, specializing in software engineering tasks. Your primary goal is to help users safely and efficiently, adhering strictly to the following instructions and utilizing your available tools.';
 const DEFAULT_REQUEST_CHANNEL = 'opencode';
@@ -73,6 +77,8 @@ let credentialCacheCheckedAt = 0;
 let authBootstrapConsumed = false;
 let activeAuthSession = null;
 let inFlightRefreshPromise = null;
+let nextAllowedRequestAt = 0;
+let requestThrottleChain = Promise.resolve();
 
 export const qwenAuthEvents = new EventEmitter();
 
@@ -94,6 +100,7 @@ class RetryableHttpError extends Error {
 }
 
 function debugLog(message, error) {
+  if (!DEBUG_ENABLED) return;
   const detail = error instanceof Error ? error.message : error ? String(error) : '';
   console.debug(`[openqwencode] ${message}${detail ? `: ${detail}` : ''}`);
 }
@@ -210,7 +217,108 @@ function parseRetryAfterMs(headers) {
 
 function getBackoffMs({ attempt = 0, retryAfterMs = null, baseMs = 1000, maxMs = 30_000 } = {}) {
   if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) return retryAfterMs;
-  return Math.min(baseMs * 2 ** attempt, maxMs);
+
+  const baseDelayMs = Math.min(baseMs * 2 ** attempt, maxMs);
+  const jitterWindowMs = Math.floor(baseDelayMs * BACKOFF_JITTER_RATIO);
+  if (jitterWindowMs <= 0) return baseDelayMs;
+
+  return Math.min(baseDelayMs + Math.floor(Math.random() * (jitterWindowMs + 1)), maxMs);
+}
+
+function pickErrorMessage(...candidates) {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+
+  return null;
+}
+
+async function createOpenAICompatibleErrorResponse(
+  response,
+  { defaultMessage, defaultType, defaultCode },
+) {
+  let responseText = '';
+
+  try {
+    responseText = await response.text();
+  } catch {
+    // ignore body read failures and fall back to a synthetic error payload
+  }
+
+  const parsed = parseJson(responseText);
+  const upstreamError = parsed?.error && typeof parsed.error === 'object' ? parsed.error : null;
+  const message = pickErrorMessage(
+    upstreamError?.message,
+    parsed?.message,
+    response.statusText,
+    defaultMessage,
+  ) ?? defaultMessage;
+
+  const headers = new Headers(response.headers);
+  headers.set('content-type', 'application/json; charset=utf-8');
+  headers.delete('content-length');
+  headers.delete('content-encoding');
+
+  return new Response(
+    JSON.stringify({
+      error: {
+        message,
+        type: typeof upstreamError?.type === 'string' && upstreamError.type ? upstreamError.type : defaultType,
+        param: upstreamError?.param ?? null,
+        code:
+          upstreamError?.code != null && upstreamError.code !== ''
+            ? upstreamError.code
+            : defaultCode,
+      },
+    }),
+    {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    },
+  );
+}
+
+async function normalizeBackoffResponse(response) {
+  if (response.status === 429) {
+    return createOpenAICompatibleErrorResponse(response, {
+      defaultMessage: 'Rate limited by upstream. Please retry shortly.',
+      defaultType: 'rate_limit_error',
+      defaultCode: 'rate_limit_exceeded',
+    });
+  }
+
+  return createOpenAICompatibleErrorResponse(response, {
+    defaultMessage: 'Upstream service temporarily failed. Please retry shortly.',
+    defaultType: 'server_error',
+    defaultCode: `upstream_${response.status}`,
+  });
+}
+
+async function waitForRequestThrottle(signal) {
+  let release;
+  const previous = requestThrottleChain;
+  requestThrottleChain = new Promise(resolve => {
+    release = resolve;
+  });
+
+  await previous;
+
+  let waitMs = 0;
+
+  try {
+    const now = Date.now();
+    const jitterMs = Math.floor(Math.random() * (REQUEST_THROTTLE_JITTER_MS + 1));
+    const scheduledAt = Math.max(now, nextAllowedRequestAt) + jitterMs;
+    nextAllowedRequestAt = scheduledAt + REQUEST_THROTTLE_MIN_SPACING_MS;
+    waitMs = Math.max(scheduledAt - now, 0);
+  } finally {
+    release();
+  }
+
+  if (waitMs > 0) {
+    await sleep(waitMs, signal);
+  }
 }
 
 function base64urlEncode(buffer) {
@@ -905,16 +1013,22 @@ function buildFetchWithAuth(getAuth) {
       return globalThis.fetch(input, init);
     }
 
-    let lastResponse = null;
-
     for (let attempt = 0; attempt < REQUEST_MAX_ATTEMPTS; attempt += 1) {
       throwIfAborted(signal);
 
+      await waitForRequestThrottle(signal);
       const response = await performAuthenticatedFetch(input, init, credentials.accessToken, requestBody.body);
-      lastResponse = response;
 
       if ((response.status === 401 || response.status === 403) && requestBody.replayable) {
         if (attempt === REQUEST_MAX_ATTEMPTS - 1) return response;
+
+        const latest = await getValidCredentials(getAuth, { signal });
+        if (latest?.accessToken && latest.accessToken !== credentials.accessToken) {
+          await response.body?.cancel?.().catch?.(() => {});
+          debugLog('Received auth error from upstream; retrying with newer cached token');
+          credentials = latest;
+          continue;
+        }
 
         const refreshed = await getValidCredentials(getAuth, { forceRefresh: true, signal });
         if (!refreshed?.accessToken || refreshed.accessToken === credentials.accessToken) {
@@ -941,10 +1055,10 @@ function buildFetchWithAuth(getAuth) {
         continue;
       }
 
-      return response;
+      return shouldBackoffResponse(response) ? normalizeBackoffResponse(response) : response;
     }
 
-    return lastResponse ?? globalThis.fetch(input, init);
+    return globalThis.fetch(input, init);
   };
 }
 

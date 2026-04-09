@@ -14,7 +14,7 @@ Use this file as the project memory for working rules, release behavior, current
 
 ## Current project status
 
-Current release: `0.1.5`
+Current release: `0.1.6`
 
 The plugin currently includes:
 
@@ -24,7 +24,10 @@ The plugin currently includes:
 - in-memory credential cache with periodic disk sync
 - proactive token refresh
 - single-flight refresh deduplication for concurrent refresh attempts
+- light upstream request throttling with jitter
 - retry and backoff handling
+- OpenAI-compatible rate-limit error shaping for cleaner OpenCode notifications
+- debug logging disabled by default unless explicitly enabled
 - auth cancellation hooks
 - legacy provider disabling
 - request metadata injection for upstream compatibility
@@ -122,37 +125,7 @@ These were reviewed and should not need to be rediscovered from scratch:
 
 ### High priority
 
-#### 1. Request throttling with jitter
-
-Why it matters:
-
-Right now the plugin reacts to `429` responses after they happen. Adding light throttling before sending requests can reduce burst traffic and avoid rate limits more often.
-
-Reference:
-
-- `RunMintOn/OpenCode-Qwen-Proxy`
-
-What to add:
-
-- a tiny request queue or minimum spacing between upstream requests
-- random jitter so concurrent clients do not retry in lockstep
-
-Suggested behavior:
-
-- minimum spacing between requests
-- small randomized delay window
-- keep existing retry logic as secondary protection
-
-Relevant code areas:
-
-- `buildFetchWithAuth()`
-- `getBackoffMs()`
-
-Priority: must-have
-
----
-
-#### 2. Rate-limit-reason-aware backoff
+#### 1. Rate-limit-reason-aware backoff
 
 Why it matters:
 
@@ -177,7 +150,7 @@ Priority: must-have
 
 ### Good follow-up improvements
 
-#### 3. Add a device-flow smoke test
+#### 2. Add a device-flow smoke test
 
 Why it matters:
 
@@ -198,7 +171,7 @@ Priority: nice-to-have
 
 ---
 
-#### 4. Config file and environment variable overrides
+#### 3. Config file and environment variable overrides
 
 Why it matters:
 
@@ -221,7 +194,6 @@ Priority: nice-to-have
 
 #### 5. Minor cleanup items
 
-- add jitter to the current generic backoff function
 - make the user-agent version come from package metadata
 - optionally add a logout or credential wipe helper
 - add a short code comment explaining the system-message injection fallback behavior
@@ -231,10 +203,13 @@ Priority: nice-to-have
 ## Recently completed work
 
 - single-flight refresh deduplication was added to avoid concurrent refresh races
+- light request throttling with jitter was added before upstream calls
+- rate-limited upstream failures are now reshaped into clean OpenAI-compatible JSON errors for OpenCode
+- debug logging now stays quiet by default unless `OPENQWENCODE_DEBUG` is enabled
 - package export shape was fixed so OpenCode now loads the plugin correctly
 - request metadata, request normalization, and user-agent handling were tightened for upstream compatibility
 - npm publish hygiene checks were added to CI and release automation
-- release `0.1.4` was published with successful GitHub Actions validation and release workflow execution
+- release `0.1.5` was published with successful GitHub Actions validation and release workflow execution
 
 ## Probably not worth the complexity right now
 
@@ -252,7 +227,6 @@ Do not add this back. The plugin intentionally exposes only `openqwencode/coder-
 
 ## Suggested implementation order
 
-1. Request throttling with jitter
-2. Rate-limit-reason-aware backoff
-3. Device-flow smoke test
-4. Config or environment overrides
+1. Rate-limit-reason-aware backoff
+2. Device-flow smoke test
+3. Config or environment overrides
