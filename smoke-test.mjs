@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import child_process from 'node:child_process';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -521,4 +522,368 @@ test('plugin internals remain available through subpath exports', async () => {
   const eventsModule = await import(`${eventsModulePath}?case=events-${Date.now()}`);
   assert.equal(typeof eventsModule.cancelActiveQwenAuth, 'function');
   assert.equal(typeof eventsModule.qwenAuthEvents.emit, 'function');
+});
+
+async function runRateLimitClassificationTest({
+  caseName,
+  responseFactory,
+  expectedStatus,
+  expectedCode,
+  expectedType,
+  expectedCategory,
+  expectedBackoffDelays,
+  expectedMessagePattern,
+}) {
+  process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
+  process.env.OPENQWENCODE_DEBUG = '1';
+
+  let requestCount = 0;
+  const scheduledSleeps = [];
+  const debugMessages = [];
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const originalRandom = Math.random;
+  const originalDebug = console.debug;
+
+  Math.random = () => 0;
+  globalThis.setTimeout = (callback, delay = 0, ...args) => {
+    scheduledSleeps.push(delay);
+    queueMicrotask(() => callback(...args));
+    return scheduledSleeps.length;
+  };
+  globalThis.clearTimeout = () => {};
+  console.debug = msg => {
+    if (typeof msg === 'string') debugMessages.push(msg);
+  };
+
+  globalThis.fetch = async input => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://portal.qwen.ai/v1/chat/completions') {
+      requestCount += 1;
+      return responseFactory();
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const pluginModule = await import(`${pluginModulePath}?case=${caseName}-${Date.now()}`);
+    const plugin = await pluginModule.default();
+
+    const authState = {
+      type: 'oauth',
+      access: 'initial-token',
+      refresh: 'initial-refresh',
+      expires: Date.now() + 5 * 60_000,
+      accountId: 'https://portal.qwen.ai',
+    };
+
+    const loader = await plugin.auth.loader(async () => authState, {
+      models: { 'coder-model': { cost: { input: 1, output: 1 } } },
+    });
+
+    const response = await loader.fetch('https://portal.qwen.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'Hello' }] }),
+    });
+
+    assert.equal(requestCount, 3);
+    assert.equal(response.status, expectedStatus);
+
+    const payload = await response.json();
+    assert.equal(payload.error.code, expectedCode);
+    assert.equal(payload.error.type, expectedType);
+    if (expectedMessagePattern) {
+      assert.match(
+        payload.error.message,
+        expectedMessagePattern,
+        `Expected ${String(expectedMessagePattern)}, got: ${payload.error.message}`,
+      );
+    }
+
+    const minimumExpectedBackoffDelay = Math.min(...expectedBackoffDelays);
+    const backoffDelays = scheduledSleeps.filter(delay => delay >= minimumExpectedBackoffDelay);
+    assert.deepEqual(backoffDelays, expectedBackoffDelays);
+    assert.ok(debugMessages.some(message => message.includes(`[${expectedCategory}]`)));
+  } finally {
+    Math.random = originalRandom;
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    console.debug = originalDebug;
+    delete process.env.OPENQWENCODE_DEBUG;
+  }
+}
+
+test('burst rate limit (429 with no x-error-code) uses short backoff and returns rate_limit_exceeded', async () => {
+  await runRateLimitClassificationTest({
+    caseName: 'burst-429',
+    responseFactory: () =>
+      new Response(JSON.stringify({ message: 'Too Many Requests' }), {
+        status: 429,
+        statusText: 'Too Many Requests',
+        headers: { 'content-type': 'application/json' },
+      }),
+    expectedStatus: 429,
+    expectedCode: 'rate_limit_exceeded',
+    expectedType: 'rate_limit_error',
+    expectedCategory: 'burst',
+    expectedBackoffDelays: [2000, 4000],
+  });
+});
+
+test('quota exhaustion (429 with x-error-code containing "quota") uses longer backoff and returns quota_exceeded', async () => {
+  await runRateLimitClassificationTest({
+    caseName: 'quota-429',
+    responseFactory: () =>
+      new Response(JSON.stringify({ message: 'Quota limit exceeded' }), {
+        status: 429,
+        statusText: 'Too Many Requests',
+        headers: {
+          'content-type': 'application/json',
+          'x-error-code': 'QuotaExhausted',
+        },
+      }),
+    expectedStatus: 429,
+    expectedCode: 'quota_exceeded',
+    expectedType: 'rate_limit_error',
+    expectedCategory: 'quota',
+    expectedBackoffDelays: [10000, 20000],
+    expectedMessagePattern: /quota/i,
+  });
+});
+
+test('transient server error (500) uses moderate backoff and returns server_error', async () => {
+  await runRateLimitClassificationTest({
+    caseName: 'transient-500',
+    responseFactory: () =>
+      new Response('Internal Server Error', {
+        status: 500,
+        statusText: 'Internal Server Error',
+      }),
+    expectedStatus: 500,
+    expectedCode: 'upstream_500',
+    expectedType: 'server_error',
+    expectedCategory: 'transient',
+    expectedBackoffDelays: [3000, 6000],
+  });
+});
+
+test('429 with x-error-code containing "gateway" is classified as transient', async () => {
+  await runRateLimitClassificationTest({
+    caseName: 'gateway-429',
+    responseFactory: () =>
+      new Response(JSON.stringify({ message: 'Gateway timeout' }), {
+        status: 429,
+        statusText: 'Too Many Requests',
+        headers: {
+          'content-type': 'application/json',
+          'x-error-code': 'GatewayTimeout',
+        },
+      }),
+    expectedStatus: 429,
+    expectedCode: 'rate_limit_exceeded',
+    expectedType: 'rate_limit_error',
+    expectedCategory: 'transient',
+    expectedBackoffDelays: [3000, 6000],
+  });
+});
+
+test('device flow authorizes, polls through pending and slow_down, then succeeds and persists credentials', async () => {
+  process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
+  process.env.OPENQWENCODE_DEBUG = '1';
+
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const originalRandom = Math.random;
+  const originalDebug = console.debug;
+  const originalSpawn = child_process.spawn;
+
+  // Stub spawn to prevent a browser tab from opening during the test
+  child_process.spawn = function stubbedSpawn() {
+    return { unref() {} };
+  };
+
+  // Stub timers so the test runs without real delays while recording scheduled waits
+  const scheduledDelays = [];
+  globalThis.setTimeout = (callback, delay = 0, ...args) => {
+    scheduledDelays.push(delay);
+    queueMicrotask(() => callback(...args));
+    return scheduledDelays.length;
+  };
+  globalThis.clearTimeout = () => {};
+
+  // Deterministic jitter for any backoff calculations
+  Math.random = () => 0;
+
+  const debugMessages = [];
+  console.debug = msg => {
+    if (typeof msg === 'string') debugMessages.push(msg);
+  };
+
+  // Drive the token polling state machine through three distinct phases
+  let tokenPollCount = 0;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    // Device authorization request
+    if (url === 'https://chat.qwen.ai/api/v1/oauth2/device/code') {
+      return new Response(
+        JSON.stringify({
+          device_code: 'test-device-code-abc',
+          user_code: 'WXYZ-5678',
+          verification_uri: 'https://chat.qwen.ai/device',
+          verification_uri_complete: 'https://chat.qwen.ai/device?code=WXYZ-5678',
+          expires_in: 900,
+          interval: 5,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+
+    // Token polling endpoint
+    if (url === 'https://chat.qwen.ai/api/v1/oauth2/token') {
+      tokenPollCount += 1;
+
+      // First poll: authorization_pending
+      if (tokenPollCount === 1) {
+        return new Response(
+          JSON.stringify({ error: 'authorization_pending' }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      // Second poll: slow_down
+      if (tokenPollCount === 2) {
+        return new Response(
+          JSON.stringify({ error: 'slow_down' }),
+          { status: 429, headers: { 'content-type': 'application/json' } },
+        );
+      }
+
+      // Third poll: success with tokens
+      return new Response(
+        JSON.stringify({
+          access_token: 'device-flow-access-token',
+          refresh_token: 'device-flow-refresh-token',
+          token_type: 'Bearer',
+          resource_url: 'https://portal.qwen.ai',
+          expires_in: 3600,
+          scope: 'openid profile email model.completion',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const pluginModule = await import(`${pluginModulePath}?case=device-flow-${Date.now()}`);
+    const plugin = await pluginModule.default();
+
+    // Capture auth events from the fresh module instance
+    const events = pluginModule.qwenAuthEvents;
+    const emittedEvents = [];
+    const eventTypes = [
+      'auth-browser-opened',
+      'auth-started',
+      'auth-pending',
+      'auth-slow-down',
+      'auth-succeeded',
+    ];
+    for (const type of eventTypes) {
+      events.on(type, data => emittedEvents.push({ type, data }));
+    }
+
+    // Step 1: Start device authorization
+    const authorizeResult = await plugin.auth.methods[0].authorize();
+
+    // Verify authorize returned the expected structure
+    assert.ok(authorizeResult.url);
+    assert.ok(authorizeResult.instructions.includes('WXYZ-5678'));
+    assert.equal(authorizeResult.method, 'auto');
+    assert.equal(typeof authorizeResult.callback, 'function');
+
+    // Verify auth-browser-opened was emitted with user code
+    const browserEvent = emittedEvents.find(e => e.type === 'auth-browser-opened');
+    assert.ok(browserEvent);
+    assert.equal(browserEvent.data.userCode, 'WXYZ-5678');
+
+    // Step 2: Drive the polling callback through pending → slow_down → success
+    const callbackResult = await authorizeResult.callback();
+
+    // Verify callback returned success
+    assert.equal(callbackResult.type, 'success');
+    assert.equal(callbackResult.access, 'device-flow-access-token');
+    assert.equal(callbackResult.refresh, 'device-flow-refresh-token');
+    assert.ok(callbackResult.expires > Date.now());
+    assert.equal(callbackResult.accountId, 'https://portal.qwen.ai');
+
+    // Verify three token polls occurred in sequence
+    assert.equal(tokenPollCount, 3);
+
+    // Step 3: Verify credentials persisted to disk
+    const credsPath = join(process.env.HOME, '.qwen', 'oauth_creds.json');
+    const creds = JSON.parse(await readFile(credsPath, 'utf8'));
+    assert.equal(creds.access_token, 'device-flow-access-token');
+    assert.equal(creds.refresh_token, 'device-flow-refresh-token');
+    assert.equal(creds.resource_url, 'https://portal.qwen.ai');
+    assert.ok(creds.expiry_date > Date.now());
+
+    // Step 4: Verify event emission sequence
+    const typeSequence = emittedEvents.map(e => e.type);
+    assert.ok(typeSequence.includes('auth-browser-opened'));
+    assert.ok(typeSequence.includes('auth-started'));
+
+    // auth-pending fires before each poll attempt
+    const pendingCount = typeSequence.filter(t => t === 'auth-pending').length;
+    assert.equal(pendingCount, 3);
+
+    // slow_down event fires once and reports an increased interval
+    const slowDownEvents = emittedEvents.filter(e => e.type === 'auth-slow-down');
+    assert.equal(slowDownEvents.length, 1);
+    assert.ok(
+      slowDownEvents[0].data.nextPollInMs >= 10_000,
+      `slow_down should increase interval to at least 10s, got ${slowDownEvents[0].data.nextPollInMs}ms`,
+    );
+
+    // succeeded event fires once with resource info
+    const succeededEvents = emittedEvents.filter(e => e.type === 'auth-succeeded');
+    assert.equal(succeededEvents.length, 1);
+    assert.equal(succeededEvents[0].data.resourceUrl, 'https://portal.qwen.ai');
+
+    // Verify events occurred in the correct order
+    const browserIdx = typeSequence.indexOf('auth-browser-opened');
+    const startedIdx = typeSequence.indexOf('auth-started');
+    const firstPendingIdx = typeSequence.indexOf('auth-pending');
+    const slowDownIdx = typeSequence.indexOf('auth-slow-down');
+    const succeededIdx = typeSequence.indexOf('auth-succeeded');
+    assert.ok(browserIdx < startedIdx, 'browser-opened before started');
+    assert.ok(startedIdx < firstPendingIdx, 'started before first pending');
+    assert.ok(firstPendingIdx < slowDownIdx, 'first pending before slow_down');
+    assert.ok(slowDownIdx < succeededIdx, 'slow_down before succeeded');
+
+    // Verify that sleep delays reflect the expected polling intervals
+    // First two sleeps: interval(5s) + margin(3s) = 8s each
+    // Third sleep: increased interval(10s) + margin(3s) = 13s
+    const pollSleeps = scheduledDelays.filter(d => d >= 8000);
+    assert.equal(pollSleeps.length, 3);
+    assert.equal(pollSleeps[0], 8000);
+    assert.equal(pollSleeps[1], 8000);
+    assert.equal(pollSleeps[2], 13000);
+  } finally {
+    child_process.spawn = originalSpawn;
+    Math.random = originalRandom;
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    console.debug = originalDebug;
+    delete process.env.OPENQWENCODE_DEBUG;
+  }
 });

@@ -14,7 +14,14 @@ Use this file as the project memory for working rules, release behavior, current
 
 ## Current project status
 
-Current release: `0.1.6`
+Current release: `0.1.7`
+
+Release `0.1.7` changes:
+
+- rate-limit-reason-aware backoff classifies 429s by `x-error-code` into burst, quota, and transient categories with distinct retry windows
+- quota-exhausted 429s now return `quota_exceeded` in OpenAI-compatible error JSON
+- smoke tests now cover rate-limit reason classification for burst, quota, and transient cases
+- a deterministic device-flow smoke test covers `authorization_pending`, `slow_down`, successful token issuance, and credential persistence
 
 The plugin currently includes:
 
@@ -123,55 +130,9 @@ These were reviewed and should not need to be rediscovered from scratch:
 
 ## Current backlog
 
-### High priority
+### Next priorities
 
-#### 1. Rate-limit-reason-aware backoff
-
-Why it matters:
-
-Not every `429` means the same thing. Temporary burst limits and quota exhaustion should not use the same retry timing.
-
-Reference:
-
-- `foxswat/opencode-qwen-auth`
-
-What to add:
-
-- inspect headers such as `x-error-code`
-- distinguish between temporary rate limit, quota exhaustion, and server-side retry cases
-- choose different wait windows per category
-
-Relevant code areas:
-
-- `buildFetchWithAuth()`
-- backoff helpers near `getBackoffMs()`
-
-Priority: must-have
-
-### Good follow-up improvements
-
-#### 2. Add a device-flow smoke test
-
-Why it matters:
-
-The current smoke tests cover config registration and refresh behavior well, but the actual device authorization polling path is still not tested.
-
-What to test:
-
-- `authorization_pending`
-- `slow_down`
-- successful token issuance
-- credential persistence after auth success
-
-Relevant files:
-
-- `smoke-test.mjs`
-
-Priority: nice-to-have
-
----
-
-#### 3. Config file and environment variable overrides
+#### 1. Config file and environment variable overrides
 
 Why it matters:
 
@@ -188,28 +149,38 @@ Reference:
 
 - `foxswat/opencode-qwen-auth`
 
-Priority: nice-to-have
+Status note:
+
+- only `OPENQWENCODE_DEBUG` exists today
+
+Priority: follow-up
 
 ---
 
-#### 5. Minor cleanup items
+#### 2. Remaining minor cleanup item
 
-- make the user-agent version come from package metadata
 - optionally add a logout or credential wipe helper
-- add a short code comment explaining the system-message injection fallback behavior
 
 Priority: nice-to-have
 
 ## Recently completed work
 
+- rate-limit-reason-aware backoff classifies 429s by `x-error-code` into burst, quota, and transient categories with distinct retry windows
+- quota-exhausted 429s now return `quota_exceeded` in OpenAI-compatible error JSON
+- smoke tests now cover rate-limit reason classification for burst, quota, and transient cases
+- a deterministic device-flow smoke test covers `authorization_pending`, `slow_down`, successful token issuance, and credential persistence
 - single-flight refresh deduplication was added to avoid concurrent refresh races
 - light request throttling with jitter was added before upstream calls
 - rate-limited upstream failures are now reshaped into clean OpenAI-compatible JSON errors for OpenCode
 - debug logging now stays quiet by default unless `OPENQWENCODE_DEBUG` is enabled
 - package export shape was fixed so OpenCode now loads the plugin correctly
 - request metadata, request normalization, and user-agent handling were tightened for upstream compatibility
+- the user-agent version now comes from package metadata
+- a short code comment now explains the system-message injection fallback behavior
 - npm publish hygiene checks were added to CI and release automation
 - release `0.1.5` was published with successful GitHub Actions validation and release workflow execution
+- release `0.1.6` was published with improved upstream request compatibility
+- release `0.1.7` is now the latest published GitHub release
 
 ## Probably not worth the complexity right now
 
@@ -227,6 +198,5 @@ Do not add this back. The plugin intentionally exposes only `openqwencode/coder-
 
 ## Suggested implementation order
 
-1. Rate-limit-reason-aware backoff
-2. Device-flow smoke test
-3. Config or environment overrides
+1. Config or environment overrides
+2. Optional credential wipe helper

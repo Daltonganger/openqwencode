@@ -42,6 +42,16 @@ const REQUEST_MAX_ATTEMPTS = 3;
 const REQUEST_THROTTLE_MIN_SPACING_MS = 300;
 const REQUEST_THROTTLE_JITTER_MS = 150;
 const BACKOFF_JITTER_RATIO = 0.2;
+const RATE_LIMIT_CATEGORY = Object.freeze({
+  BURST: 'burst',
+  QUOTA: 'quota',
+  TRANSIENT: 'transient',
+});
+const RATE_LIMIT_BACKOFF_PRESETS = {
+  [RATE_LIMIT_CATEGORY.BURST]: { baseMs: 2_000, maxMs: 15_000 },
+  [RATE_LIMIT_CATEGORY.QUOTA]: { baseMs: 10_000, maxMs: 60_000 },
+  [RATE_LIMIT_CATEGORY.TRANSIENT]: { baseMs: 3_000, maxMs: 30_000 },
+};
 const DEBUG_ENABLED = /^(1|true|yes)$/i.test(process.env.OPENQWENCODE_DEBUG ?? '');
 const SYSTEM_MESSAGE =
   'You are Qwen Code, an interactive CLI agent developed by Alibaba Group, specializing in software engineering tasks. Your primary goal is to help users safely and efficiently, adhering strictly to the following instructions and utilizing your available tools.';
@@ -225,6 +235,23 @@ function getBackoffMs({ attempt = 0, retryAfterMs = null, baseMs = 1000, maxMs =
   return Math.min(baseDelayMs + Math.floor(Math.random() * (jitterWindowMs + 1)), maxMs);
 }
 
+function classifyRateLimitCategory(headers, status) {
+  if (status >= 500) return RATE_LIMIT_CATEGORY.TRANSIENT;
+  if (status !== 429) return RATE_LIMIT_CATEGORY.BURST;
+
+  const errorCode = (headers?.get?.('x-error-code') ?? '').toLowerCase();
+
+  if (/quota|exhausted|insufficient/.test(errorCode)) return RATE_LIMIT_CATEGORY.QUOTA;
+  if (/internal|timeout|service_unavailable|gateway/.test(errorCode)) return RATE_LIMIT_CATEGORY.TRANSIENT;
+
+  return RATE_LIMIT_CATEGORY.BURST;
+}
+
+function getRateLimitBackoffMs({ attempt = 0, retryAfterMs = null, category = RATE_LIMIT_CATEGORY.BURST } = {}) {
+  const preset = RATE_LIMIT_BACKOFF_PRESETS[category] ?? RATE_LIMIT_BACKOFF_PRESETS[RATE_LIMIT_CATEGORY.BURST];
+  return getBackoffMs({ attempt, retryAfterMs, baseMs: preset.baseMs, maxMs: preset.maxMs });
+}
+
 function pickErrorMessage(...candidates) {
   for (const candidate of candidates) {
     if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
@@ -280,7 +307,17 @@ async function createOpenAICompatibleErrorResponse(
 }
 
 async function normalizeBackoffResponse(response) {
+  const category = classifyRateLimitCategory(response.headers, response.status);
+
   if (response.status === 429) {
+    if (category === RATE_LIMIT_CATEGORY.QUOTA) {
+      return createOpenAICompatibleErrorResponse(response, {
+        defaultMessage: 'Upstream quota exhausted. Please wait before retrying.',
+        defaultType: 'rate_limit_error',
+        defaultCode: 'quota_exceeded',
+      });
+    }
+
     return createOpenAICompatibleErrorResponse(response, {
       defaultMessage: 'Rate limited by upstream. Please retry shortly.',
       defaultType: 'rate_limit_error',
@@ -1044,13 +1081,13 @@ function buildFetchWithAuth(getAuth) {
       if (shouldBackoffResponse(response) && requestBody.replayable && attempt < REQUEST_MAX_ATTEMPTS - 1) {
         await response.body?.cancel?.().catch?.(() => {});
 
-        const delayMs = getBackoffMs({
+        const category = classifyRateLimitCategory(response.headers, response.status);
+        const delayMs = getRateLimitBackoffMs({
           attempt,
           retryAfterMs: parseRetryAfterMs(response.headers),
-          baseMs: 1_000,
-          maxMs: 20_000,
+          category,
         });
-        debugLog(`Upstream returned ${response.status}; retrying in ${delayMs}ms`);
+        debugLog(`Upstream returned ${response.status} [${category}]; retrying in ${delayMs}ms`);
         await sleep(delayMs, signal);
         continue;
       }

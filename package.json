@@ -1,6 +1,6 @@
 {
   "name": "openqwencode",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "OpenCode plugin for Qwen OAuth login and free Qwen Code models",
   "author": "Daltonganger",
   "type": "module",
