@@ -1,6 +1,6 @@
 {
   "name": "openqwencode",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "OpenCode plugin for Qwen OAuth login and free Qwen Code models",
   "author": "Daltonganger",
   "type": "module",
@@ -8,13 +8,18 @@
   "files": [
     "index.js",
     "plugin.js",
+    "link.js",
     "events.js",
     "README.md"
   ],
   "exports": {
     ".": "./index.js",
     "./plugin": "./plugin.js",
+    "./link": "./link.js",
     "./events": "./events.js"
+  },
+  "bin": {
+    "openqwencode": "link.js"
   },
   "scripts": {
     "test": "node --test smoke-test.mjs"

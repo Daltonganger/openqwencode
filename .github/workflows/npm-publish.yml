@@ -55,7 +55,7 @@ jobs:
 
           const packResult = JSON.parse(readFileSync('npm-pack.json', 'utf8'));
           const files = new Set((packResult[0]?.files ?? []).map(file => file.path));
-          const expectedFiles = new Set(['README.md', 'events.js', 'index.js', 'package.json', 'plugin.js']);
+          const expectedFiles = new Set(['README.md', 'events.js', 'index.js', 'link.js', 'package.json', 'plugin.js']);
 
           const unexpectedFiles = [...files].filter(file => !expectedFiles.has(file));
           const missingFiles = [...expectedFiles].filter(file => !files.has(file));

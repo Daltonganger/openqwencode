@@ -13,7 +13,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { join } from 'node:path';
 
 const require = createRequire(import.meta.url);
@@ -22,10 +22,9 @@ const { version: PACKAGE_VERSION } = require('./package.json');
 const PROVIDER_ID = 'openqwencode';
 const PROVIDER_NAME = 'OpenQwenCode';
 const MODEL_ID = 'coder-model';
-const CREDS_DIR = join(homedir(), '.qwen');
-const CREDS_PATH = join(CREDS_DIR, 'oauth_creds.json');
-const LOCK_PATH = join(CREDS_DIR, 'oauth_creds.lock');
-const DEFAULT_BASE_URL = 'https://portal.qwen.ai/v1';
+const OFFICIAL_BASE_URL = 'https://portal.qwen.ai/v1';
+const CONFIGURED_BASE_URL = normalizeBaseURL(process.env.OPENQWENCODE_BASE_URL);
+const DEFAULT_BASE_URL = CONFIGURED_BASE_URL ?? OFFICIAL_BASE_URL;
 const LEGACY_PROVIDER_IDS = ['qwen', 'qwen-code'];
 const CREDS_DIR_MODE = 0o700;
 const CREDS_FILE_MODE = 0o600;
@@ -84,7 +83,26 @@ const QWEN_MODELS = {
 let credentialCache = null;
 let credentialCacheMtimeMs = 0;
 let credentialCacheCheckedAt = 0;
+let telemetryCredentialCache = null;
+let telemetryCredentialCacheMtimeMs = 0;
+let telemetryCredentialCacheCheckedAt = 0;
 let authBootstrapConsumed = false;
+
+function getCredsDir() {
+  return join(homedir(), '.qwen');
+}
+
+function getCredsPath() {
+  return join(getCredsDir(), 'oauth_creds.json');
+}
+
+function getTelemetryCredsPath() {
+  return join(getCredsDir(), 'telemetry_creds.json');
+}
+
+function getLockPath() {
+  return join(getCredsDir(), 'oauth_creds.lock');
+}
 let activeAuthSession = null;
 let inFlightRefreshPromise = null;
 let nextAllowedRequestAt = 0;
@@ -223,6 +241,59 @@ function parseRetryAfterMs(headers) {
   if (Number.isNaN(retryAfterDate)) return null;
 
   return Math.max(retryAfterDate - Date.now(), 0);
+}
+
+function normalizeHttpUrl(candidate) {
+  if (typeof candidate !== 'string' || !candidate.trim()) return null;
+
+  try {
+    const parsed = new URL(candidate.trim());
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return parsed.toString();
+  } catch {
+    // ignore invalid configured urls
+  }
+
+  return null;
+}
+
+function normalizeServiceBaseUrl(candidate) {
+  const normalized = normalizeHttpUrl(candidate);
+  return normalized ? normalized.replace(/\/+$/, '') : null;
+}
+
+function resolveTelemetryLinkBaseUrl(telemetryEndpoint) {
+  const normalized = normalizeHttpUrl(telemetryEndpoint);
+  if (!normalized) return null;
+
+  try {
+    const parsed = new URL(normalized);
+    const trimmedPath = parsed.pathname.replace(/\/+$/, '');
+    parsed.pathname = trimmedPath.toLowerCase().endsWith('/telemetry')
+      ? trimmedPath.slice(0, -'/telemetry'.length) || '/'
+      : '/';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.pathname === '/' ? parsed.origin : `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return null;
+  }
+}
+
+function getTelemetryEndpoint() {
+  return normalizeHttpUrl(process.env.OPENQWENCODE_TELEMETRY_ENDPOINT);
+}
+
+function getTelemetryLinkBaseUrl() {
+  return (
+    normalizeServiceBaseUrl(process.env.OPENQWENCODE_TELEMETRY_LINK_URL) ??
+    resolveTelemetryLinkBaseUrl(getTelemetryEndpoint())
+  );
+}
+
+function normalizeBaseURL(candidate) {
+  const normalized = normalizeHttpUrl(candidate);
+  if (!normalized) return null;
+  return normalized.endsWith('/v1') ? normalized : `${normalized.replace(/\/+$/, '')}/v1`;
 }
 
 function getBackoffMs({ attempt = 0, retryAfterMs = null, baseMs = 1000, maxMs = 30_000 } = {}) {
@@ -369,10 +440,167 @@ function generatePKCE() {
 }
 
 function resolveBaseURL(resourceUrl) {
+  if (CONFIGURED_BASE_URL) return CONFIGURED_BASE_URL;
   if (!resourceUrl || typeof resourceUrl !== 'string') return DEFAULT_BASE_URL;
 
   const normalized = resourceUrl.startsWith('http') ? resourceUrl : `https://${resourceUrl}`;
   return normalized.endsWith('/v1') ? normalized : `${normalized.replace(/\/+$/, '')}/v1`;
+}
+
+function getDeviceCode() {
+  const seed = `${hostname()}:${process.platform}:${process.arch}`;
+  return createHash('sha256').update(seed).digest('hex').slice(0, 12);
+}
+
+function buildTelemetryEvent({ input, status, attempts, startedAt }) {
+  const url = (() => {
+    try {
+      return new URL(input instanceof Request ? input.url : String(input));
+    } catch {
+      return null;
+    }
+  })();
+
+  return {
+    ts: new Date().toISOString(),
+    deviceCode: getDeviceCode(),
+    requestCount: 1,
+    attempts,
+    status,
+    durationMs: Math.max(Date.now() - startedAt, 0),
+    path: url?.pathname ?? null,
+  };
+}
+
+async function sendTelemetryEvent(event) {
+  const telemetryEndpoint = getTelemetryEndpoint();
+  if (!telemetryEndpoint) return;
+
+  try {
+    const telemetryCreds = await loadTelemetryCredentialsFromDisk();
+    const headers = { 'content-type': 'application/json' };
+    if (telemetryCreds?.linkToken) {
+      headers.Authorization = `Bearer ${telemetryCreds.linkToken}`;
+    }
+
+    await globalThis.fetch(telemetryEndpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(event),
+      signal: AbortSignal.timeout?.(2000),
+    });
+  } catch (error) {
+    debugLog('Telemetry delivery failed', error);
+  }
+}
+
+async function requestTelemetryLink(deviceCode, signal) {
+  const telemetryLinkBaseUrl = getTelemetryLinkBaseUrl();
+  if (!telemetryLinkBaseUrl) {
+    throw new Error('Set OPENQWENCODE_TELEMETRY_ENDPOINT or OPENQWENCODE_TELEMETRY_LINK_URL first');
+  }
+
+  const response = await globalThis.fetch(`${telemetryLinkBaseUrl}/device-link/request`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({
+      deviceId: deviceCode,
+      deviceName: hostname(),
+      pluginVersion: PACKAGE_VERSION,
+    }),
+    signal,
+  });
+
+  const text = await response.text();
+  const data = parseJson(text);
+  if (!response.ok) {
+    throw new Error(`Device link request failed: ${data.error ?? response.status}`);
+  }
+
+  if (!data?.pollToken || !data?.linkCode) {
+    throw new Error('Device link request returned an invalid payload');
+  }
+
+  return {
+    pollToken: data.pollToken,
+    linkCode: data.linkCode,
+    expiresIn: typeof data.expiresIn === 'number' ? data.expiresIn : 900,
+    pollIntervalMs: typeof data.pollIntervalMs === 'number' ? data.pollIntervalMs : 5000,
+    verificationUrl: normalizeVerificationUrl(data.verificationUrl ?? `${telemetryLinkBaseUrl}/link`),
+  };
+}
+
+async function pollTelemetryLink(pollToken, signal) {
+  const telemetryLinkBaseUrl = getTelemetryLinkBaseUrl();
+  if (!telemetryLinkBaseUrl) {
+    throw new Error('Telemetry link base URL is not configured');
+  }
+
+  const response = await globalThis.fetch(`${telemetryLinkBaseUrl}/device-link/poll`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: JSON.stringify({ pollToken }),
+    signal,
+  });
+
+  const text = await response.text();
+  const data = parseJson(text);
+  if (!response.ok) {
+    throw new Error(`Device link polling failed: ${data.error ?? response.status}`);
+  }
+
+  return data;
+}
+
+export async function linkDevice({ signal, log = console.log, autoOpen = true } = {}) {
+  const deviceCode = getDeviceCode();
+  const deviceLink = await requestTelemetryLink(deviceCode, signal);
+
+  if (autoOpen) {
+    openBrowser(deviceLink.verificationUrl);
+  }
+
+  if (typeof log === 'function') {
+    log(`Visit ${deviceLink.verificationUrl}`);
+    log(`Enter code: ${deviceLink.linkCode}`);
+  }
+
+  const timeoutAt = Date.now() + deviceLink.expiresIn * 1000;
+  const pollIntervalMs = Math.max(deviceLink.pollIntervalMs, 1000);
+
+  while (Date.now() < timeoutAt) {
+    throwIfAborted(signal);
+    const status = await pollTelemetryLink(deviceLink.pollToken, signal);
+
+    if (status?.status === 'approved' && typeof status.linkToken === 'string' && status.linkToken) {
+      await saveTelemetryCredentials({
+        linkToken: status.linkToken,
+        linkedAt: Date.now(),
+        deviceCode,
+        verificationUrl: deviceLink.verificationUrl,
+      });
+
+      if (typeof log === 'function') {
+        log('Device linked successfully.');
+      }
+
+      return {
+        status: 'approved',
+        linkCode: deviceLink.linkCode,
+        linkToken: status.linkToken,
+        deviceCode,
+        verificationUrl: deviceLink.verificationUrl,
+      };
+    }
+
+    if (status?.status === 'expired') {
+      throw new Error('Device link expired before it was approved');
+    }
+
+    await sleep(pollIntervalMs, signal);
+  }
+
+  throw new Error('Device link timed out before it was approved');
 }
 
 function normalizeVerificationUrl(candidate) {
@@ -455,10 +683,48 @@ function serializeCredentials(creds) {
   );
 }
 
+function normalizeTelemetryCredentials(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+
+  const linkToken = raw.link_token ?? raw.linkToken;
+  const linkedAtRaw = raw.linked_at ?? raw.linkedAt;
+  const linkedAt = typeof linkedAtRaw === 'number' ? linkedAtRaw : Number(linkedAtRaw);
+  const deviceCode = raw.device_code ?? raw.deviceCode;
+  const verificationUrl = raw.verification_url ?? raw.verificationUrl;
+
+  if (typeof linkToken !== 'string' || !linkToken) return null;
+
+  return {
+    linkToken,
+    linkedAt: Number.isFinite(linkedAt) ? linkedAt : Date.now(),
+    deviceCode: typeof deviceCode === 'string' && deviceCode ? deviceCode : getDeviceCode(),
+    verificationUrl: typeof verificationUrl === 'string' && verificationUrl ? verificationUrl : undefined,
+  };
+}
+
+function serializeTelemetryCredentials(creds) {
+  return JSON.stringify(
+    {
+      link_token: creds.linkToken,
+      linked_at: creds.linkedAt,
+      device_code: creds.deviceCode,
+      verification_url: creds.verificationUrl,
+    },
+    null,
+    2,
+  );
+}
+
 function updateCredentialCache(creds, mtimeMs = Date.now()) {
   credentialCache = creds ? { ...creds } : null;
   credentialCacheMtimeMs = creds ? mtimeMs : 0;
   credentialCacheCheckedAt = Date.now();
+}
+
+function updateTelemetryCredentialCache(creds, mtimeMs = Date.now()) {
+  telemetryCredentialCache = creds ? { ...creds } : null;
+  telemetryCredentialCacheMtimeMs = creds ? mtimeMs : 0;
+  telemetryCredentialCacheCheckedAt = Date.now();
 }
 
 function isCredentialFresh(creds) {
@@ -467,14 +733,14 @@ function isCredentialFresh(creds) {
 }
 
 async function ensureCredentialsDir() {
-  await mkdir(CREDS_DIR, { recursive: true, mode: CREDS_DIR_MODE });
+  await mkdir(getCredsDir(), { recursive: true, mode: CREDS_DIR_MODE });
 }
 
 async function maybeClearStaleLock() {
   try {
-    const info = await stat(LOCK_PATH);
+    const info = await stat(getLockPath());
     if (Date.now() - info.mtimeMs <= LOCK_STALE_MS) return;
-    await rm(LOCK_PATH, { force: true });
+    await rm(getLockPath(), { force: true });
     debugLog('Removed stale credential lock');
   } catch {
     // ignore lock cleanup failures
@@ -491,7 +757,7 @@ async function acquireCredentialLock(signal) {
     throwIfAborted(signal);
 
     try {
-      const handle = await open(LOCK_PATH, 'wx', CREDS_FILE_MODE);
+      const handle = await open(getLockPath(), 'wx', CREDS_FILE_MODE);
       try {
         await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
       } finally {
@@ -504,7 +770,7 @@ async function acquireCredentialLock(signal) {
 
       return async () => {
         try {
-          await rm(LOCK_PATH, { force: true });
+          await rm(getLockPath(), { force: true });
         } catch {
           // ignore lock cleanup failures
         }
@@ -544,14 +810,14 @@ async function loadCredentialsFromDisk({ force = false } = {}) {
   }
 
   try {
-    const info = await stat(CREDS_PATH);
+    const info = await stat(getCredsPath());
 
     if (credentialCache && !force && credentialCacheMtimeMs === info.mtimeMs) {
       credentialCacheCheckedAt = now;
       return credentialCache;
     }
 
-    const raw = parseJson(await readFile(CREDS_PATH, 'utf-8'));
+    const raw = parseJson(await readFile(getCredsPath(), 'utf-8'));
     const creds = normalizeCredentials(raw);
     updateCredentialCache(creds, info.mtimeMs);
     return creds;
@@ -564,6 +830,33 @@ async function loadCredentialsFromDisk({ force = false } = {}) {
   }
 }
 
+async function loadTelemetryCredentialsFromDisk({ force = false } = {}) {
+  const now = Date.now();
+  if (telemetryCredentialCache && !force && now - telemetryCredentialCacheCheckedAt < CACHE_RELOAD_INTERVAL_MS) {
+    return telemetryCredentialCache;
+  }
+
+  try {
+    const info = await stat(getTelemetryCredsPath());
+
+    if (telemetryCredentialCache && !force && telemetryCredentialCacheMtimeMs === info.mtimeMs) {
+      telemetryCredentialCacheCheckedAt = now;
+      return telemetryCredentialCache;
+    }
+
+    const raw = parseJson(await readFile(getTelemetryCredsPath(), 'utf-8'));
+    const creds = normalizeTelemetryCredentials(raw);
+    updateTelemetryCredentialCache(creds, info.mtimeMs);
+    return creds;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      debugLog('Failed to read telemetry credential file', error);
+    }
+    updateTelemetryCredentialCache(null);
+    return null;
+  }
+}
+
 async function persistCredentialsUnlocked(creds) {
   const normalized = normalizeCredentials(creds);
   if (!normalized?.accessToken && !normalized?.refreshToken) {
@@ -572,14 +865,38 @@ async function persistCredentialsUnlocked(creds) {
 
   await ensureCredentialsDir();
 
-  const tempPath = `${CREDS_PATH}.tmp.${randomUUID()}`;
+  const credsPath = getCredsPath();
+  const tempPath = `${credsPath}.tmp.${randomUUID()}`;
   const payload = serializeCredentials(normalized);
 
   try {
     await writeFile(tempPath, payload, { encoding: 'utf-8', mode: CREDS_FILE_MODE });
-    await rename(tempPath, CREDS_PATH);
-    const info = await stat(CREDS_PATH).catch(() => null);
+    await rename(tempPath, credsPath);
+    const info = await stat(credsPath).catch(() => null);
     updateCredentialCache(normalized, info?.mtimeMs ?? Date.now());
+    return normalized;
+  } finally {
+    await rm(tempPath, { force: true }).catch(() => {});
+  }
+}
+
+async function persistTelemetryCredentialsUnlocked(creds) {
+  const normalized = normalizeTelemetryCredentials(creds);
+  if (!normalized?.linkToken) {
+    throw new Error('Cannot persist empty telemetry credentials');
+  }
+
+  await ensureCredentialsDir();
+
+  const telemetryCredsPath = getTelemetryCredsPath();
+  const tempPath = `${telemetryCredsPath}.tmp.${randomUUID()}`;
+  const payload = serializeTelemetryCredentials(normalized);
+
+  try {
+    await writeFile(tempPath, payload, { encoding: 'utf-8', mode: CREDS_FILE_MODE });
+    await rename(tempPath, telemetryCredsPath);
+    const info = await stat(telemetryCredsPath).catch(() => null);
+    updateTelemetryCredentialCache(normalized, info?.mtimeMs ?? Date.now());
     return normalized;
   } finally {
     await rm(tempPath, { force: true }).catch(() => {});
@@ -588,6 +905,10 @@ async function persistCredentialsUnlocked(creds) {
 
 async function saveCredentials(creds) {
   return withCredentialLock(() => persistCredentialsUnlocked(creds));
+}
+
+async function saveTelemetryCredentials(creds) {
+  return withCredentialLock(() => persistTelemetryCredentialsUnlocked(creds));
 }
 
 async function getStoredAuth(getAuth) {
@@ -1044,6 +1365,7 @@ function buildFetchWithAuth(getAuth) {
   return async (input, init) => {
     const signal = init?.signal;
     const requestBody = prepareRequestBody(init?.body);
+    const startedAt = Date.now();
 
     let credentials = await getValidCredentials(getAuth, { signal });
     if (!credentials?.accessToken) {
@@ -1092,7 +1414,16 @@ function buildFetchWithAuth(getAuth) {
         continue;
       }
 
-      return shouldBackoffResponse(response) ? normalizeBackoffResponse(response) : response;
+      const finalResponse = shouldBackoffResponse(response) ? await normalizeBackoffResponse(response) : response;
+      void sendTelemetryEvent(
+        buildTelemetryEvent({
+          input,
+          status: finalResponse.status,
+          attempts: attempt + 1,
+          startedAt,
+        }),
+      );
+      return finalResponse;
     }
 
     return globalThis.fetch(input, init);

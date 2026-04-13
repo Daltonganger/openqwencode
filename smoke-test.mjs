@@ -1,15 +1,44 @@
-import test from 'node:test';
+import { test as _nodeTest } from 'node:test';
 import assert from 'node:assert/strict';
 import child_process from 'node:child_process';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const modulePath = new URL('./index.js', import.meta.url).href;
 const pluginModulePath = new URL('./plugin.js', import.meta.url).href;
+const linkModulePath = new URL('./link.js', import.meta.url).href;
 const eventsModulePath = new URL('./events.js', import.meta.url).href;
 const packageJson = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'));
 const userAgentPrefix = `QwenCode/${packageJson.version} `;
+
+// Serialize all tests to prevent concurrent global stubbing of setTimeout /
+// Math.random / fetch from leaking between tests.  Node's built-in runner
+// executes test() callbacks concurrently by default and does not expose
+// describe.serial, so we chain each test on the previous one's completion.
+// A short macrotask settling delay is added between tests so fire-and-forget
+// telemetry calls from the previous test can finish before the next test
+// replaces globalThis.setTimeout.
+let _serialChain = Promise.resolve();
+
+function test(name, fn) {
+  const prev = _serialChain;
+  let done;
+  _serialChain = new Promise(r => { done = r; });
+
+  _nodeTest(name, async () => {
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      // Let pending fire-and-forget work (telemetry, etc.) settle before the
+      // next test potentially stubs globals.  Using the real setTimeout here
+      // is safe because the test's own finally block has already restored it.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      done();
+    }
+  });
+}
 
 test('plugin registers provider and disables legacy providers', async () => {
   process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
@@ -38,6 +67,36 @@ test('plugin registers provider and disables legacy providers', async () => {
   assert.equal(config.provider['qwen-code'], undefined);
   assert.equal(config.provider.openqwencode.models['coder-model'].attachment, true);
   assert.equal(config.provider.openqwencode.models['coder-model'].tool_call, true);
+});
+
+test('base URL env override takes precedence over the default and credential resource URL', async () => {
+  process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
+  process.env.OPENQWENCODE_BASE_URL = 'https://qwen.2631.eu';
+
+  try {
+    const pluginModule = await import(`${pluginModulePath}?case=base-url-override-${Date.now()}`);
+    const plugin = await pluginModule.default();
+
+    const config = { provider: {} };
+    await plugin.config(config);
+    assert.equal(config.provider.openqwencode.options.baseURL, 'https://qwen.2631.eu/v1');
+
+    const authState = {
+      type: 'oauth',
+      access: 'initial-token',
+      refresh: 'initial-refresh',
+      expires: Date.now() + 5 * 60_000,
+      accountId: 'https://portal.qwen.ai',
+    };
+
+    const loader = await plugin.auth.loader(async () => authState, {
+      models: { 'coder-model': { cost: { input: 1, output: 1 } } },
+    });
+
+    assert.equal(loader.baseURL, 'https://qwen.2631.eu/v1');
+  } finally {
+    delete process.env.OPENQWENCODE_BASE_URL;
+  }
 });
 
 test('loader bootstraps creds, persists them, and retries with refresh on 401', async () => {
@@ -512,6 +571,80 @@ test('string chat content is normalized into text parts', async () => {
   }
 });
 
+test('optional telemetry posts minimal request metadata to the configured endpoint', async () => {
+  process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
+  process.env.OPENQWENCODE_TELEMETRY_ENDPOINT = 'https://qwen.2631.eu/telemetry';
+
+  const telemetryCalls = [];
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    const request = input instanceof Request ? input : new Request(input, init);
+
+    if (url === 'https://portal.qwen.ai/v1/chat/completions') {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    if (url === 'https://qwen.2631.eu/telemetry') {
+      telemetryCalls.push({
+        method: request.method,
+        headers: Object.fromEntries(request.headers.entries()),
+        body: JSON.parse(request.body ? await request.text() : '{}'),
+      });
+      return new Response(null, { status: 204 });
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const pluginModule = await import(`${pluginModulePath}?case=telemetry-${Date.now()}`);
+    const plugin = await pluginModule.default();
+
+    const authState = {
+      type: 'oauth',
+      access: 'initial-token',
+      refresh: 'initial-refresh',
+      expires: Date.now() + 5 * 60_000,
+      accountId: 'https://portal.qwen.ai',
+    };
+
+    const loader = await plugin.auth.loader(async () => authState, {
+      models: { 'coder-model': { cost: { input: 1, output: 1 } } },
+    });
+
+    const response = await loader.fetch('https://portal.qwen.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'Hello telemetry' }] }),
+    });
+
+    assert.equal(response.status, 200);
+
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    assert.equal(telemetryCalls.length, 1);
+    assert.equal(telemetryCalls[0].method, 'POST');
+    assert.match(telemetryCalls[0].headers['content-type'] ?? '', /^application\/json/i);
+    assert.equal(telemetryCalls[0].body.requestCount, 1);
+    assert.equal(telemetryCalls[0].body.attempts, 1);
+    assert.equal(telemetryCalls[0].body.status, 200);
+    assert.equal(telemetryCalls[0].body.path, '/v1/chat/completions');
+    assert.equal(typeof telemetryCalls[0].body.ts, 'string');
+    assert.ok(!Number.isNaN(Date.parse(telemetryCalls[0].body.ts)));
+    assert.equal(typeof telemetryCalls[0].body.durationMs, 'number');
+    assert.ok(telemetryCalls[0].body.durationMs >= 0);
+    assert.match(telemetryCalls[0].body.deviceCode, /^[a-f0-9]{12}$/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete process.env.OPENQWENCODE_TELEMETRY_ENDPOINT;
+  }
+});
+
 test('plugin internals remain available through subpath exports', async () => {
   process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
 
@@ -550,7 +683,9 @@ async function runRateLimitClassificationTest({
   globalThis.setTimeout = (callback, delay = 0, ...args) => {
     scheduledSleeps.push(delay);
     queueMicrotask(() => callback(...args));
-    return scheduledSleeps.length;
+    // Return a timer-like object so AbortSignal.timeout().unref() does not
+    // throw when the real setTimeout has been replaced by this stub.
+    return { unref() {}, ref() { return this; } };
   };
   globalThis.clearTimeout = () => {};
   console.debug = msg => {
@@ -692,6 +827,162 @@ test('429 with x-error-code containing "gateway" is classified as transient', as
   });
 });
 
+test('linkDevice requests a short code, polls until approved, and persists telemetry credentials', async () => {
+  process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
+  process.env.OPENQWENCODE_TELEMETRY_ENDPOINT = 'https://qwen.2631.eu/telemetry';
+
+  const originalFetch = globalThis.fetch;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const originalSpawn = child_process.spawn;
+
+  child_process.spawn = function stubbedSpawn() {
+    return { unref() {} };
+  };
+
+  const scheduledDelays = [];
+  globalThis.setTimeout = (callback, delay = 0, ...args) => {
+    scheduledDelays.push(delay);
+    queueMicrotask(() => callback(...args));
+    return { unref() {}, ref() { return this; } };
+  };
+  globalThis.clearTimeout = () => {};
+
+  let pollCount = 0;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+
+    if (url === 'https://qwen.2631.eu/device-link/request') {
+      return new Response(
+        JSON.stringify({
+          pollToken: 'poll-token-123',
+          linkCode: 'AX7K2M',
+          expiresIn: 900,
+          pollIntervalMs: 5000,
+          verificationUrl: 'https://qwen.2631.eu/link',
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+
+    if (url === 'https://qwen.2631.eu/device-link/poll') {
+      pollCount += 1;
+      if (pollCount === 1) {
+        return new Response(JSON.stringify({ status: 'pending' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+
+      return new Response(JSON.stringify({ status: 'approved', linkToken: 'telemetry-link-token' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const linkModule = await import(`${linkModulePath}?case=link-device-${Date.now()}`);
+    const logs = [];
+    const result = await linkModule.linkDevice({ log: message => logs.push(message) });
+
+    assert.equal(result.status, 'approved');
+    assert.equal(result.linkCode, 'AX7K2M');
+    assert.equal(result.linkToken, 'telemetry-link-token');
+    assert.equal(pollCount, 2);
+    assert.ok(logs.some(message => message.includes('AX7K2M')));
+    assert.ok(logs.some(message => message.includes('Device linked successfully')));
+
+    const telemetryCredsPath = join(process.env.HOME, '.qwen', 'telemetry_creds.json');
+    const telemetryCreds = JSON.parse(await readFile(telemetryCredsPath, 'utf8'));
+    assert.equal(telemetryCreds.link_token, 'telemetry-link-token');
+    assert.equal(typeof telemetryCreds.device_code, 'string');
+    assert.equal(telemetryCreds.verification_url, 'https://qwen.2631.eu/link');
+    assert.deepEqual(scheduledDelays, [5000]);
+  } finally {
+    delete process.env.OPENQWENCODE_TELEMETRY_ENDPOINT;
+    child_process.spawn = originalSpawn;
+    globalThis.fetch = originalFetch;
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+});
+
+test('telemetry events include the stored bearer token when a device link exists', async () => {
+  process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
+  process.env.OPENQWENCODE_TELEMETRY_ENDPOINT = 'https://qwen.2631.eu/telemetry';
+
+  const qwenDir = join(process.env.HOME, '.qwen');
+  await mkdir(qwenDir, { recursive: true });
+  await writeFile(
+    join(qwenDir, 'telemetry_creds.json'),
+    JSON.stringify({
+      link_token: 'telemetry-link-token',
+      linked_at: Date.now(),
+      device_code: 'linked-device-123',
+    }),
+  );
+
+  const originalFetch = globalThis.fetch;
+  let telemetryAuthorization = null;
+  let resolveTelemetryDelivery;
+  const telemetryDelivered = new Promise(resolve => {
+    resolveTelemetryDelivery = resolve;
+  });
+
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : input.url;
+    const request = input instanceof Request ? input : new Request(input, init);
+
+    if (url === 'https://portal.qwen.ai/v1/chat/completions') {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    if (url === 'https://qwen.2631.eu/telemetry') {
+      telemetryAuthorization = request.headers.get('authorization');
+      resolveTelemetryDelivery();
+      return new Response(null, { status: 204 });
+    }
+
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const pluginModule = await import(`${pluginModulePath}?case=telemetry-bearer-${Date.now()}`);
+    const plugin = await pluginModule.default();
+
+    const authState = {
+      type: 'oauth',
+      access: 'initial-token',
+      refresh: 'initial-refresh',
+      expires: Date.now() + 5 * 60_000,
+      accountId: 'https://portal.qwen.ai',
+    };
+
+    const loader = await plugin.auth.loader(async () => authState, {
+      models: { 'coder-model': { cost: { input: 1, output: 1 } } },
+    });
+
+    const response = await loader.fetch('https://portal.qwen.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: 'Hello' }] }),
+    });
+
+    assert.equal(response.status, 200);
+    await telemetryDelivered;
+    assert.equal(telemetryAuthorization, 'Bearer telemetry-link-token');
+  } finally {
+    delete process.env.OPENQWENCODE_TELEMETRY_ENDPOINT;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('device flow authorizes, polls through pending and slow_down, then succeeds and persists credentials', async () => {
   process.env.HOME = await mkdtemp(join(tmpdir(), 'openqwencode-home-'));
   process.env.OPENQWENCODE_DEBUG = '1';
@@ -713,7 +1004,7 @@ test('device flow authorizes, polls through pending and slow_down, then succeeds
   globalThis.setTimeout = (callback, delay = 0, ...args) => {
     scheduledDelays.push(delay);
     queueMicrotask(() => callback(...args));
-    return scheduledDelays.length;
+    return { unref() {}, ref() { return this; } };
   };
   globalThis.clearTimeout = () => {};
 
@@ -887,3 +1178,4 @@ test('device flow authorizes, polls through pending and slow_down, then succeeds
     delete process.env.OPENQWENCODE_DEBUG;
   }
 });
+

@@ -88,6 +88,52 @@ Run OpenCode with the plugin model:
 opencode --model openqwencode/coder-model
 ```
 
+Link this install to your telemetry dashboard connection:
+
+```bash
+npx openqwencode link
+```
+
+## Optional environment variables
+
+Keep these unset unless you explicitly want the behavior.
+
+- `OPENQWENCODE_BASE_URL`: overrides the upstream OpenAI-compatible API base URL. If set to a bare origin such as `https://qwen.2631.eu`, the plugin normalizes it to `/v1` automatically.
+- `OPENQWENCODE_TELEMETRY_ENDPOINT`: sends a best-effort telemetry `POST` after each final model request response.
+- `OPENQWENCODE_TELEMETRY_LINK_URL`: optional override for the device-link service base URL. If unset, the plugin derives it from `OPENQWENCODE_TELEMETRY_ENDPOINT`.
+
+Example:
+
+```bash
+export OPENQWENCODE_BASE_URL="https://qwen.2631.eu"
+export OPENQWENCODE_TELEMETRY_ENDPOINT="https://qwen.2631.eu/telemetry"
+# optional if your link flow lives elsewhere
+export OPENQWENCODE_TELEMETRY_LINK_URL="https://qwen.2631.eu"
+```
+
+The telemetry payload is intentionally minimal:
+
+```json
+{
+  "ts": "2026-04-13T12:34:56.789Z",
+  "deviceCode": "a1b2c3d4e5f6",
+  "requestCount": 1,
+  "attempts": 1,
+  "status": 200,
+  "durationMs": 842,
+  "path": "/v1/chat/completions"
+}
+```
+
+Notes:
+
+- your telemetry server will already see the client IP at the HTTP layer, so the plugin does not send it explicitly
+- `deviceCode` is a deterministic short hash derived from the local machine identity so you can distinguish computers without sending raw host details
+- the device-link flow stores its long-lived telemetry token separately in `~/.qwen/telemetry_creds.json`
+- run `npx openqwencode link` to open the dashboard link page, enter the short code shown in the terminal, and attach this computer to one shared connection bucket
+- telemetry is fire-and-forget, best-effort, and disabled by default
+- no official public Qwen Code reset time could be confirmed; use the UTC timestamp (`ts`) to inspect your own reset pattern from collected telemetry
+
 If you upgraded from an older published version and OpenCode still does not see the model, clear the cached package and refresh:
 
 ```bash

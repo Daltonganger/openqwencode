@@ -14,14 +14,15 @@ Use this file as the project memory for working rules, release behavior, current
 
 ## Current project status
 
-Current release: `0.1.7`
+Current release: `0.1.8`
 
-Release `0.1.7` changes:
+Release `0.1.8` changes:
 
-- rate-limit-reason-aware backoff classifies 429s by `x-error-code` into burst, quota, and transient categories with distinct retry windows
-- quota-exhausted 429s now return `quota_exceeded` in OpenAI-compatible error JSON
-- smoke tests now cover rate-limit reason classification for burst, quota, and transient cases
-- a deterministic device-flow smoke test covers `authorization_pending`, `slow_down`, successful token issuance, and credential persistence
+- `OPENQWENCODE_BASE_URL` now allows routing model requests through a custom OpenAI-compatible base URL
+- optional telemetry can now post request metadata to a configured endpoint and attach a bearer token for linked devices
+- a device-link flow now supports linking installs through `linkDevice()` and the new `link.js` CLI/subpath
+- telemetry link credentials are now stored separately in `~/.qwen/telemetry_creds.json`
+- smoke tests now cover base URL overrides, telemetry delivery, bearer-token telemetry auth, and device-link persistence
 
 The plugin currently includes:
 
@@ -47,6 +48,7 @@ The plugin currently includes:
 - `plugin.js`: main plugin implementation
 - `index.js`: root package entrypoint, exports the plugin default for OpenCode compatibility
 - `events.js`: subpath exports for `qwenAuthEvents` and `cancelActiveQwenAuth`
+- `link.js`: subpath export and CLI entry for telemetry device linking
 - `smoke-test.mjs`: smoke test coverage
 - `.github/workflows/npm-publish.yml`: CI validation and npm publish workflow
 - `AGENTS.md`: contributor/agent memory and backlog
@@ -83,6 +85,7 @@ Expected npm package contents:
 - `README.md`
 - `events.js`
 - `index.js`
+- `link.js`
 - `package.json`
 - `plugin.js`
 
@@ -180,7 +183,7 @@ Priority: nice-to-have
 - npm publish hygiene checks were added to CI and release automation
 - release `0.1.5` was published with successful GitHub Actions validation and release workflow execution
 - release `0.1.6` was published with improved upstream request compatibility
-- release `0.1.7` is now the latest published GitHub release
+- release `0.1.7` was published with rate-limit-aware backoff and deterministic device-flow smoke coverage
 
 ## Probably not worth the complexity right now
 
