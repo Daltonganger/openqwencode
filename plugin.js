@@ -22,7 +22,7 @@ const { version: PACKAGE_VERSION } = require('./package.json');
 const PROVIDER_ID = 'openqwencode';
 const PROVIDER_NAME = 'OpenQwenCode';
 const MODEL_ID = 'coder-model';
-const OFFICIAL_BASE_URL = 'https://portal.qwen.ai/v1';
+const OFFICIAL_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
 const CONFIGURED_BASE_URL = normalizeBaseURL(process.env.OPENQWENCODE_BASE_URL);
 const DEFAULT_BASE_URL = CONFIGURED_BASE_URL ?? OFFICIAL_BASE_URL;
 const LEGACY_PROVIDER_IDS = ['qwen', 'qwen-code'];
@@ -1260,6 +1260,9 @@ function transformRequestBody(body) {
     if (!raw) return body;
 
     const parsed = JSON.parse(raw);
+    if (parsed.enable_thinking == null) {
+      parsed.enable_thinking = false;
+    }
     const messages = Array.isArray(parsed.messages)
       ? parsed.messages.map(message => {
           if (!message || typeof message !== 'object') return message;
